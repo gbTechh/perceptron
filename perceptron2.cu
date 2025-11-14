@@ -19,7 +19,6 @@ struct ImageData {
   unsigned char pixels[PIXELS_PER_IMAGE];
 };
 
-// Kernel CORREGIDO para actualizar pesos
 __global__ void actualizarPesosKernel(float *pesos, unsigned char *pixels,
                                       int *labels, float learning_rate,
                                       int num_images, int pixels_per_image) {
@@ -28,7 +27,6 @@ __global__ void actualizarPesosKernel(float *pesos, unsigned char *pixels,
   if (img_idx < num_images) {
     int d = labels[img_idx];
 
-    // Calcular predicción
     float sum = pesos[0];
     for (int i = 0; i < pixels_per_image; i++) {
       float pixel = pixels[img_idx * pixels_per_image + i];
@@ -38,12 +36,9 @@ __global__ void actualizarPesosKernel(float *pesos, unsigned char *pixels,
 
     int y = (sum > 0) ? 1 : -1;
 
-    // Actualizar pesos si hay error (MISMO ALGORITMO QUE CPU)
     if (y != d) {
-      // Bias
       pesos[0] += learning_rate * (d - y) * 1.0f;
 
-      // Pesos de píxeles
       for (int i = 0; i < pixels_per_image; i++) {
         float pixel = pixels[img_idx * pixels_per_image + i];
         float x = (pixel / 255.0f) * 2.0f - 1.0f;
@@ -66,7 +61,7 @@ private:
   vector<float> h_pesos;
   vector<unsigned char> h_pixels;
   vector<int> h_labels;
-  vector<int> indices; // Para shuffling
+  vector<int> indices;
 
 public:
   PerceptronCUDA(int _label, float _learning_rate, int _pixels_per_image) {
@@ -74,7 +69,6 @@ public:
     learning_rate = _learning_rate;
     pixels_per_image = _pixels_per_image;
 
-    // Inicializar pesos (IGUAL QUE CPU)
     h_pesos.resize(pixels_per_image + 1);
     for (int i = 0; i < pixels_per_image + 1; i++) {
       h_pesos[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 0.01f;
@@ -109,10 +103,8 @@ public:
     int num_images = h_labels.size();
 
     for (int epoca = 0; epoca < max_epocas; epoca++) {
-      // SHUFFLE (IMPORTANTE!)
       random_shuffle(indices.begin(), indices.end());
 
-      // Reordenar datos según shuffle
       vector<unsigned char> pixels_shuffled(num_images * pixels_per_image);
       vector<int> labels_shuffled(num_images);
 
@@ -125,14 +117,12 @@ public:
         }
       }
 
-      // Copiar datos shufflados a GPU
       cudaMemcpy(d_pixels, pixels_shuffled.data(),
                  num_images * pixels_per_image * sizeof(unsigned char),
                  cudaMemcpyHostToDevice);
       cudaMemcpy(d_labels, labels_shuffled.data(), num_images * sizeof(int),
                  cudaMemcpyHostToDevice);
 
-      // Actualizar pesos en GPU
       int blockSize = 256;
       int numBlocks = (num_images + blockSize - 1) / blockSize;
 
@@ -141,9 +131,7 @@ public:
           pixels_per_image);
       cudaDeviceSynchronize();
 
-      // Verificar progreso cada 5 épocas
       if (epoca % 5 == 0) {
-        // Calcular precisión actual
         cudaMemcpy(h_pesos.data(), d_pesos,
                    (pixels_per_image + 1) * sizeof(float),
                    cudaMemcpyDeviceToHost);
@@ -167,7 +155,6 @@ public:
       }
     }
 
-    // Copiar pesos finales
     cudaMemcpy(h_pesos.data(), d_pesos, (pixels_per_image + 1) * sizeof(float),
                cudaMemcpyDeviceToHost);
   }
@@ -187,7 +174,6 @@ public:
     cudaFree(d_labels);
   }
 };
-// Funciones para cargar datos (las mismas que antes)
 vector<ImageData> load_all_batches() {
   vector<ImageData> all_data;
   vector<string> batch_files = {"./cifar-10-batches-bin/data_batch_1.bin",
@@ -231,27 +217,23 @@ int main() {
 
   auto start = chrono::high_resolution_clock::now();
 
-  // Cargar datos
   vector<ImageData> train_data = load_all_batches();
   vector<ImageData> test_data = load_test_batch();
 
   cout << "Datos entrenamiento: " << train_data.size() << endl;
   cout << "Datos prueba: " << test_data.size() << endl;
 
-  // Crear perceptrones
   vector<PerceptronCUDA> perceptrones;
   for (int i = 0; i < CANT_PERCEPTRONS; i++) {
     perceptrones.emplace_back(i, 0.0001f, PIXELS_PER_IMAGE);
     perceptrones[i].cargarDatos(train_data);
   }
 
-  // Entrenar
   cout << "\n=== ENTRENAMIENTO ===" << endl;
   for (int i = 0; i < CANT_PERCEPTRONS; i++) {
     perceptrones[i].entrenamiento(20);
   }
 
-  // Probar
   cout << "\n=== PRUEBA ===" << endl;
   int aciertos = 0;
 
