@@ -1,5 +1,8 @@
 % %
-    writefile perceptron2.cu
+    writefile perceptron_cuda.cu
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
@@ -9,62 +12,182 @@
     using namespace std;
 
 const int CANT_PERCEPTRONS = 10;
-
-#define CUDA_CHECK(cmd)                                                        \
-  do {                                                                         \
-    cudaError_t err = cmd;                                                     \
-    if (err != cudaSuccess) {                                                  \
-      cerr << "CUDA error: " << cudaGetErrorString(err) << " at " << __FILE__  \
-           << ":" << __LINE__ << endl;                                         \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
+const int PIXELS_PER_IMAGE = 3072;
 
 struct ImageData {
   unsigned char label;
-  vector<unsigned char> pixels;
+  unsigned char pixels[PIXELS_PER_IMAGE];
 };
 
-// ============ KERNEL SIMPLE SIN SHARED MEMORY ============
-__global__ void perceptron_forward_simple(float *pesos, float *pixels_norm,
-                                          float *output, int num_pixels) {
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+// Kernel CORREGIDO para actualizar pesos
+__global__ void actualizarPesosKernel(float *pesos, unsigned char *pixels,
+                                      int *labels, float learning_rate,
+                                      int num_images, int pixels_per_image) {
+  int img_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  // Solo calcular si estamos dentro del rango
-  if (idx < num_pixels) {
-    output[idx] = pesos[idx + 1] * pixels_norm[idx];
-  }
-}
-__global__ void perceptron_forward_reduce(float *pesos, float *pixels_norm,
-                                          float *result, int num_pixels) {
-  extern __shared__ float cache[];
+  if (img_idx < num_images) {
+    int d = labels[img_idx];
 
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  int cacheIndex = threadIdx.x;
-  float temp = 0.0f;
-
-  // Cada hilo multiplica un peso por su pixel
-  if (idx < num_pixels) {
-    temp = pesos[idx + 1] * pixels_norm[idx];
-  }
-  cache[cacheIndex] = temp;
-
-  __syncthreads();
-
-  // Reducción en memoria compartida
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (cacheIndex < stride) {
-      cache[cacheIndex] += cache[cacheIndex + stride];
+    // Calcular predicción
+    float sum = pesos[0];
+    for (int i = 0; i < pixels_per_image; i++) {
+      float pixel = pixels[img_idx * pixels_per_image + i];
+      float x = (pixel / 255.0f) * 2.0f - 1.0f;
+      sum += pesos[i + 1] * x;
     }
-    __syncthreads();
-  }
 
-  // El hilo 0 de cada bloque escribe su suma parcial
-  if (cacheIndex == 0) {
-    atomicAdd(result, cache[0]);
+    int y = (sum > 0) ? 1 : -1;
+
+    // Actualizar pesos si hay error (MISMO ALGORITMO QUE CPU)
+    if (y != d) {
+      // Bias
+      pesos[0] += learning_rate * (d - y) * 1.0f;
+
+      // Pesos de píxeles
+      for (int i = 0; i < pixels_per_image; i++) {
+        float pixel = pixels[img_idx * pixels_per_image + i];
+        float x = (pixel / 255.0f) * 2.0f - 1.0f;
+        pesos[i + 1] += learning_rate * (d - y) * x;
+      }
+    }
   }
 }
-// ============ FUNCIONES DE CARGA ============
+
+class PerceptronCUDA {
+private:
+  int label;
+  float learning_rate;
+  int pixels_per_image;
+
+  float *d_pesos;
+  unsigned char *d_pixels;
+  int *d_labels;
+
+  vector<float> h_pesos;
+  vector<unsigned char> h_pixels;
+  vector<int> h_labels;
+  vector<int> indices; // Para shuffling
+
+public:
+  PerceptronCUDA(int _label, float _learning_rate, int _pixels_per_image) {
+    label = _label;
+    learning_rate = _learning_rate;
+    pixels_per_image = _pixels_per_image;
+
+    // Inicializar pesos (IGUAL QUE CPU)
+    h_pesos.resize(pixels_per_image + 1);
+    for (int i = 0; i < pixels_per_image + 1; i++) {
+      h_pesos[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 0.01f;
+    }
+
+    cudaMalloc(&d_pesos, (pixels_per_image + 1) * sizeof(float));
+    cudaMemcpy(d_pesos, h_pesos.data(), (pixels_per_image + 1) * sizeof(float),
+               cudaMemcpyHostToDevice);
+  }
+
+  void cargarDatos(const vector<ImageData> &dataset) {
+    h_pixels.resize(dataset.size() * pixels_per_image);
+    h_labels.resize(dataset.size());
+    indices.resize(dataset.size());
+
+    for (int i = 0; i < dataset.size(); i++) {
+      h_labels[i] = (dataset[i].label == label) ? 1 : -1;
+      indices[i] = i;
+      for (int j = 0; j < pixels_per_image; j++) {
+        h_pixels[i * pixels_per_image + j] = dataset[i].pixels[j];
+      }
+    }
+
+    cudaMalloc(&d_pixels,
+               dataset.size() * pixels_per_image * sizeof(unsigned char));
+    cudaMalloc(&d_labels, dataset.size() * sizeof(int));
+  }
+
+  void entrenamiento(int max_epocas = 20) {
+    cout << "Entrenando perceptron " << label << " en GPU..." << endl;
+
+    int num_images = h_labels.size();
+
+    for (int epoca = 0; epoca < max_epocas; epoca++) {
+      // SHUFFLE (IMPORTANTE!)
+      random_shuffle(indices.begin(), indices.end());
+
+      // Reordenar datos según shuffle
+      vector<unsigned char> pixels_shuffled(num_images * pixels_per_image);
+      vector<int> labels_shuffled(num_images);
+
+      for (int i = 0; i < num_images; i++) {
+        int orig_idx = indices[i];
+        labels_shuffled[i] = h_labels[orig_idx];
+        for (int j = 0; j < pixels_per_image; j++) {
+          pixels_shuffled[i * pixels_per_image + j] =
+              h_pixels[orig_idx * pixels_per_image + j];
+        }
+      }
+
+      // Copiar datos shufflados a GPU
+      cudaMemcpy(d_pixels, pixels_shuffled.data(),
+                 num_images * pixels_per_image * sizeof(unsigned char),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_labels, labels_shuffled.data(), num_images * sizeof(int),
+                 cudaMemcpyHostToDevice);
+
+      // Actualizar pesos en GPU
+      int blockSize = 256;
+      int numBlocks = (num_images + blockSize - 1) / blockSize;
+
+      actualizarPesosKernel<<<numBlocks, blockSize>>>(
+          d_pesos, d_pixels, d_labels, learning_rate, num_images,
+          pixels_per_image);
+      cudaDeviceSynchronize();
+
+      // Verificar progreso cada 5 épocas
+      if (epoca % 5 == 0) {
+        // Calcular precisión actual
+        cudaMemcpy(h_pesos.data(), d_pesos,
+                   (pixels_per_image + 1) * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+
+        int aciertos = 0;
+        for (int i = 0; i < num_images; i++) {
+          float sum = h_pesos[0];
+          for (int j = 0; j < pixels_per_image; j++) {
+            float x =
+                (h_pixels[i * pixels_per_image + j] / 255.0f) * 2.0f - 1.0f;
+            sum += h_pesos[j + 1] * x;
+          }
+          int pred = (sum > 0) ? 1 : -1;
+          if (pred == h_labels[i])
+            aciertos++;
+        }
+
+        float precision = 100.0f * aciertos / num_images;
+        cout << "  Epoca " << epoca << ": " << precision << "% correcto"
+             << endl;
+      }
+    }
+
+    // Copiar pesos finales
+    cudaMemcpy(h_pesos.data(), d_pesos, (pixels_per_image + 1) * sizeof(float),
+               cudaMemcpyDeviceToHost);
+  }
+
+  float predecir(const ImageData &imagen) {
+    float sum = h_pesos[0];
+    for (int i = 0; i < pixels_per_image; i++) {
+      float x = (imagen.pixels[i] / 255.0f) * 2.0f - 1.0f;
+      sum += h_pesos[i + 1] * x;
+    }
+    return sum;
+  }
+
+  ~PerceptronCUDA() {
+    cudaFree(d_pesos);
+    cudaFree(d_pixels);
+    cudaFree(d_labels);
+  }
+};
+// Funciones para cargar datos (las mismas que antes)
 vector<ImageData> load_all_batches() {
   vector<ImageData> all_data;
   vector<string> batch_files = {"./cifar-10-batches-bin/data_batch_1.bin",
@@ -75,22 +198,17 @@ vector<ImageData> load_all_batches() {
 
   for (const string &filename : batch_files) {
     ifstream file(filename, ios::binary);
-    if (!file.is_open()) {
-      cerr << "No se pudo abrir: " << filename << endl;
+    if (!file.is_open())
       continue;
-    }
 
     for (int i = 0; i < 10000; i++) {
       ImageData img;
       file.read((char *)&img.label, 1);
-      img.pixels.resize(3072);
-      file.read((char *)img.pixels.data(), 3072);
+      file.read((char *)img.pixels, PIXELS_PER_IMAGE);
       all_data.push_back(img);
     }
     file.close();
   }
-  cout << "Cargadas " << all_data.size() << " imágenes de entrenamiento"
-       << endl;
   return all_data;
 }
 
@@ -98,287 +216,76 @@ vector<ImageData> load_test_batch() {
   vector<ImageData> test_data;
   ifstream file("./cifar-10-batches-bin/test_batch.bin", ios::binary);
 
-  if (!file.is_open()) {
-    cerr << "No se pudo abrir test_batch.bin" << endl;
-    return test_data;
-  }
-
   for (int i = 0; i < 10000; i++) {
     ImageData img;
     file.read((char *)&img.label, 1);
-    img.pixels.resize(3072);
-    file.read((char *)img.pixels.data(), 3072);
+    file.read((char *)img.pixels, PIXELS_PER_IMAGE);
     test_data.push_back(img);
   }
   file.close();
-  cout << "Cargadas " << test_data.size() << " imágenes de test" << endl;
   return test_data;
 }
 
-// ============ CLASE PERCEPTRON ============
-class Perceptron {
-public:
-  int label;
-  int bias = 1;
-  float n;
-  int sizeX;
-  vector<ImageData> dataset;
-
-  // Memoria GPU
-  float *d_pesos;
-  float *d_pixels_norm;
-  float *d_output;
-
-public:
-  vector<float> v_pesos;
-  Perceptron(const Perceptron &) = delete;
-  Perceptron &operator=(const Perceptron &) = delete;
-  Perceptron(Perceptron &&other) noexcept {
-    label = other.label;
-    bias = other.bias;
-    n = other.n;
-    sizeX = other.sizeX;
-    dataset = std::move(other.dataset);
-    v_pesos = std::move(other.v_pesos);
-
-    d_pesos = other.d_pesos;
-    d_pixels_norm = other.d_pixels_norm;
-    d_output = other.d_output;
-
-    // Evitar que el destructor libere la memoria dos veces
-    other.d_pesos = nullptr;
-    other.d_pixels_norm = nullptr;
-    other.d_output = nullptr;
-  }
-
-  Perceptron &operator=(Perceptron &&other) noexcept {
-    if (this != &other) {
-      cudaFree(d_pesos);
-      cudaFree(d_pixels_norm);
-      cudaFree(d_output);
-
-      label = other.label;
-      bias = other.bias;
-      n = other.n;
-      sizeX = other.sizeX;
-      dataset = std::move(other.dataset);
-      v_pesos = std::move(other.v_pesos);
-
-      d_pesos = other.d_pesos;
-      d_pixels_norm = other.d_pixels_norm;
-      d_output = other.d_output;
-
-      other.d_pesos = nullptr;
-      other.d_pixels_norm = nullptr;
-      other.d_output = nullptr;
-    }
-    return *this;
-  }
-
-  Perceptron(int _label, int _size, int _w, float _n,
-             vector<ImageData> _dataset) {
-    label = _label;
-    sizeX = _size;
-    dataset = _dataset;
-    n = _n;
-
-    v_pesos.resize(sizeX + 1, _w);
-
-    // Reservar memoria GPU
-    CUDA_CHECK(cudaMalloc(&d_pesos, (sizeX + 1) * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_pixels_norm, sizeX * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, sizeX * sizeof(float)));
-
-    // Copiar pesos iniciales
-    CUDA_CHECK(cudaMemcpy(d_pesos, v_pesos.data(), (sizeX + 1) * sizeof(float),
-                          cudaMemcpyHostToDevice));
-  }
-
-  ~Perceptron() {
-    cudaFree(d_pesos);
-    cudaFree(d_pixels_norm);
-    cudaFree(d_output);
-  }
-
-  int fn(float value) { return (value > 0) ? 1 : -1; }
-
-  float normalizacion(unsigned char pixel) {
-    return (pixel / 255.0f) * 2.0f - 1.0f;
-  }
-
-  void updatePesos(int d, int y, int row) {
-    for (int i = 0; i < v_pesos.size(); i++) {
-      float x = 1;
-      if (i > 0) {
-        x = normalizacion(dataset[row].pixels[i - 1]);
-      }
-      v_pesos[i] = v_pesos[i] + n * (d - y) * x;
-    }
-
-    CUDA_CHECK(cudaMemcpy(d_pesos, v_pesos.data(), (sizeX + 1) * sizeof(float),
-                          cudaMemcpyHostToDevice));
-  }
-
-  void entrenamiento(int epoca = 100) {
-    while (epoca > 0) {
-      // cout << "Epoca: " << epoca << endl;
-      for (int i = 0; i < dataset.size(); i++) { // Solo 5 imágenes
-        int d = (dataset[i].label == label) ? 1 : -1;
-
-        // Normalizar pixels
-        vector<float> pixels_norm(sizeX);
-        for (int j = 0; j < sizeX; j++) {
-          pixels_norm[j] = normalizacion(dataset[i].pixels[j]);
-        }
-        CUDA_CHECK(cudaMemcpy(d_pixels_norm, pixels_norm.data(),
-                              sizeX * sizeof(float), cudaMemcpyHostToDevice));
-
-        // Configurar ejecución del kernel
-        int threads = 1024;
-        int blocks = (sizeX + threads - 1) / threads;
-        if (blocks > 65535)
-          blocks = 65535;
-
-        // cout << "Launching kernel with " << blocks << " blocks, " << threads
-        // << " threads per block, sizeX=" << sizeX << endl;
-
-        perceptron_forward_simple<<<blocks, threads>>>(d_pesos, d_pixels_norm,
-                                                       d_output, sizeX);
-
-        // Verificar error del kernel
-        cudaError_t kernelErr = cudaGetLastError();
-        if (kernelErr != cudaSuccess) {
-          cerr << "Error kernel: " << cudaGetErrorString(kernelErr) << endl;
-          cerr << "Blocks: " << blocks << ", Threads: " << threads << endl;
-          continue;
-        }
-
-        CUDA_CHECK(cudaDeviceSynchronize());
-        // Recuperar y sumar en CPU
-        vector<float> output(sizeX);
-        CUDA_CHECK(cudaMemcpy(output.data(), d_output, sizeX * sizeof(float),
-                              cudaMemcpyDeviceToHost));
-
-        float sum = bias * v_pesos[0];
-        for (int j = 0; j < sizeX; j++) {
-          sum += output[j];
-        }
-
-        int y = fn(sum);
-        if (y != d) {
-          updatePesos(d, y, i);
-        }
-      }
-      epoca--;
-    }
-  }
-
-  int predecir(const ImageData &imagen) {
-    vector<float> pixels_norm(sizeX);
-    for (int j = 0; j < sizeX; j++) {
-      pixels_norm[j] = normalizacion(imagen.pixels[j]);
-    }
-
-    CUDA_CHECK(cudaMemcpy(d_pixels_norm, pixels_norm.data(),
-                          sizeX * sizeof(float), cudaMemcpyHostToDevice));
-
-    int threads = 256;
-    int blocks = (sizeX + threads - 1) / threads;
-    if (blocks > 65535)
-      blocks = 65535;
-
-    perceptron_forward_simple<<<blocks, threads>>>(d_pesos, d_pixels_norm,
-                                                   d_output, sizeX);
-
-    cudaError_t kernelErr = cudaGetLastError();
-    if (kernelErr != cudaSuccess) {
-      cerr << "Error kernel predicción: " << cudaGetErrorString(kernelErr)
-           << endl;
-      return -1;
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    vector<float> output(sizeX);
-    CUDA_CHECK(cudaMemcpy(output.data(), d_output, sizeX * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-
-    float sum = bias * v_pesos[0];
-    for (int j = 0; j < sizeX; j++) {
-      sum += output[j];
-    }
-
-    return fn(sum);
-  }
-};
-
-// ============ MAIN ============
 int main() {
-  cout << "=== PERCEPTRON CUDA ===" << endl;
+  cout << "=== PERCEPTRON CON CUDA ===" << endl;
 
-  int deviceCount;
-  CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-  cout << "Dispositivos CUDA: " << deviceCount << endl;
+  auto start = chrono::high_resolution_clock::now();
 
-  if (deviceCount == 0) {
-    cerr << "No hay GPU CUDA" << endl;
-    return 1;
-  }
-
-  CUDA_CHECK(cudaSetDevice(0));
-
+  // Cargar datos
   vector<ImageData> train_data = load_all_batches();
   vector<ImageData> test_data = load_test_batch();
 
-  if (train_data.empty()) {
-    cerr << "No hay datos de entrenamiento" << endl;
-    return 1;
+  cout << "Datos entrenamiento: " << train_data.size() << endl;
+  cout << "Datos prueba: " << test_data.size() << endl;
+
+  // Crear perceptrones
+  vector<PerceptronCUDA> perceptrones;
+  for (int i = 0; i < CANT_PERCEPTRONS; i++) {
+    perceptrones.emplace_back(i, 0.0001f, PIXELS_PER_IMAGE);
+    perceptrones[i].cargarDatos(train_data);
   }
 
-  cout << "\nCreando " << CANT_PERCEPTRONS << " perceptrones..." << endl;
-  vector<Perceptron> perceptrones;
-  for (int label = 0; label < CANT_PERCEPTRONS; label++) {
-
-    perceptrones.emplace_back(label, train_data[0].pixels.size(), 0, 0.01,
-                              train_data);
-  }
-
+  // Entrenar
   cout << "\n=== ENTRENAMIENTO ===" << endl;
-  for (auto &p : perceptrones) {
-    p.entrenamiento(50); // Solo 2 épocas
+  for (int i = 0; i < CANT_PERCEPTRONS; i++) {
+    perceptrones[i].entrenamiento(20);
   }
 
-  cout << "\n--- PRUEBAS ---" << endl;
+  // Probar
+  cout << "\n=== PRUEBA ===" << endl;
   int aciertos = 0;
-  int total = test_data.size();
 
-  for (int i = 0; i < total; i++) {
-    ImageData &imagen = test_data[i];
-    int label_real = imagen.label;
-
-    float max_sum = -1e9;
-    int pred_label = -1;
+  for (int i = 0; i < test_data.size(); i++) {
+    int label_real = test_data[i].label;
+    int pred_label = 0;
+    float max_confianza = -1e9;
 
     for (int j = 0; j < CANT_PERCEPTRONS; j++) {
-      int pred = perceptrones[j].predecir(imagen);
-      if (pred == 1) {
+      float confianza = perceptrones[j].predecir(test_data[i]);
+      if (confianza > max_confianza) {
+        max_confianza = confianza;
         pred_label = j;
-        break;
       }
     }
 
     if (pred_label == label_real)
       aciertos++;
 
-    cout << "Imagen " << i << " - Real: " << (int)label_real
-         << " Predicho: " << pred_label << endl;
+    if (i < 10) {
+      cout << "Imagen " << i << ": Real=" << label_real
+           << ", Pred=" << pred_label
+           << (pred_label == label_real ? " ✓" : " ✗") << endl;
+    }
   }
 
-  float precision = (aciertos * 100.0f) / total;
-  cout << "\n=== RESULTADOS ===" << endl;
-  cout << "Aciertos: " << aciertos << "/" << total << " (" << precision << "%)"
-       << endl;
+  auto end = chrono::high_resolution_clock::now();
+  auto duration = chrono::duration_cast<chrono::seconds>(end - start);
 
-  cout << "\n=== COMPLETADO ===" << endl;
+  float precision = 100.0f * aciertos / test_data.size();
+  cout << "\n=== RESULTADOS ===" << endl;
+  cout << "Precision: " << aciertos << "/" << test_data.size() << " ("
+       << precision << "%)" << endl;
+  cout << "Tiempo total: " << duration.count() << " segundos" << endl;
+
   return 0;
 }

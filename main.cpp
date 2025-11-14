@@ -127,7 +127,7 @@ public:
     int mejor_aciertos = 0;
 
     while (epoca <= max_epocas) {
-      guardar_pesos(); // Guardar pesos al inicio de época
+      guardar_pesos();
 
       int errores_epoca = 0;
 
