@@ -109,7 +109,6 @@ public:
     return max_cambio;
   }
 
-  // <- NUEVA FUNCIÓN: Guardar pesos actuales para comparar después
   void guardar_pesos_anteriores() {
     for (int i = 0; i < v_pesos.size(); i++) {
       pesos_anteriores[i] = v_pesos[i];
