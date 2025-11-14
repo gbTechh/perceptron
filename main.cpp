@@ -61,7 +61,7 @@ private:
   float n;
   int sizeX;
   vector<ImageData> dataset;
-  vector<float> prev_pesos; // Para detectar convergencia
+  vector<float> pesos_anteriores;
 
 public:
   vector<float> v_pesos;
@@ -74,39 +74,19 @@ public:
     n = _n;
 
     v_pesos.resize(sizeX + 1);
-    prev_pesos.resize(sizeX + 1);
+    pesos_anteriores.resize(sizeX + 1);
 
-    // Inicialización aleatoria pequeña
     for (int i = 0; i < sizeX + 1; i++) {
       v_pesos[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * 0.01f;
+      pesos_anteriores[i] = v_pesos[i];
     }
   }
 
-  int fn(float value) {
-    if (value > 0) {
-      return 1;
-    } else if (value < 0) {
-      return -1;
-    }
-    return 0;
-  }
+  int fn(float value) { return (value > 0) ? 1 : -1; }
 
   float normalizacion(unsigned char pixel) {
     return (pixel / 255.0f) * 2.0f - 1.0f;
   }
-
-  // Calcular diferencia entre pesos actuales y anteriores
-  float calcular_cambio_pesos() {
-    float max_diff = 0.0f;
-    for (int i = 0; i < v_pesos.size(); i++) {
-      float diff = fabs(v_pesos[i] - prev_pesos[i]);
-      max_diff = max(max_diff, diff);
-    }
-    return max_diff;
-  }
-
-  // Guardar pesos actuales
-  void guardar_pesos() { prev_pesos = v_pesos; }
 
   void updatePesos(int d, int y, int row) {
     for (int i = 0; i < v_pesos.size(); i++) {
@@ -118,92 +98,70 @@ public:
     }
   }
 
-  void entrenamiento(int max_epocas = 100, float convergence_threshold = 1e-5,
-                     int patience = 3) {
-    cout << "Entrenando perceptrón para clase " << label << endl;
+  float calcular_cambio_pesos() {
+    float max_cambio = 0.0f;
+    for (int i = 0; i < v_pesos.size(); i++) {
+      float cambio = fabs(v_pesos[i] - pesos_anteriores[i]);
+      if (cambio > max_cambio) {
+        max_cambio = cambio;
+      }
+    }
+    return max_cambio;
+  }
 
-    int epoca = 1;
-    int epocas_sin_mejora = 0;
-    int mejor_aciertos = 0;
+  void guardar_pesos_anteriores() {
+    for (int i = 0; i < v_pesos.size(); i++) {
+      pesos_anteriores[i] = v_pesos[i];
+    }
+  }
 
-    while (epoca <= max_epocas) {
-      guardar_pesos();
+  void entrenamiento(int max_epocas = 100) {
+    int epoca_actual = max_epocas;
+    const float UMBRAL_CAMBIO = n * 1000.0f;
 
-      int errores_epoca = 0;
+    while (epoca_actual > 0) {
+      cout << "Epoca: " << (max_epocas - epoca_actual + 1) << "\n";
 
-      // Entrenar una época completa
+      guardar_pesos_anteriores();
+      bool hubo_cambio = false;
+
       for (int i = 0; i < dataset.size(); i++) {
         int d = (dataset[i].label == label) ? 1 : -1;
 
-        float sum = 0;
-        sum += bias * v_pesos[0];
+        float sum = bias * v_pesos[0];
         for (int j = 0; j < dataset[i].pixels.size(); j++) {
-          unsigned char pix = dataset[i].pixels[j];
-          float x = normalizacion(pix);
+          float x = normalizacion(dataset[i].pixels[j]);
           sum += v_pesos[j + 1] * x;
         }
 
         int y = fn(sum);
+
         if (y != d) {
           updatePesos(d, y, i);
-          errores_epoca++;
+          hubo_cambio = true;
         }
       }
 
-      int aciertos_epoca = dataset.size() - errores_epoca;
-      float precision_epoca = (aciertos_epoca * 100.0f) / dataset.size();
+      float cambio_maximo = calcular_cambio_pesos();
+      cout << "  Cambio maximo en pesos: " << cambio_maximo << endl;
 
-      // CONDICIÓN 1: Cambio en pesos es muy pequeño
-      float cambio_pesos = calcular_cambio_pesos();
-
-      // CONDICIÓN 2: No hay errores (convergencia perfecta)
-      bool convergencia_perfecta = (errores_epoca == 0);
-
-      // CONDICIÓN 3: No hay mejora significativa (early stopping por patience)
-      if (aciertos_epoca > mejor_aciertos) {
-        mejor_aciertos = aciertos_epoca;
-        epocas_sin_mejora = 0;
-      } else {
-        epocas_sin_mejora++;
+      if (cambio_maximo > UMBRAL_CAMBIO) {
+        cout << " Pesos cambiando demasiado...!" << endl;
       }
 
-      // Mostrar progreso cada 5 épocas o si es la primera
-      if (epoca % 5 == 0 || epoca == 1) {
-        cout << "  Época " << epoca << " | Errores: " << errores_epoca << " ("
-             << precision_epoca << "% correcto)"
-             << " | Cambio pesos: " << cambio_pesos << endl;
-      }
-
-      // DETENER SI:
-      // 1. Convergencia perfecta (sin errores)
-      if (convergencia_perfecta) {
-        cout << "  ✓ Convergencia perfecta en época " << epoca << " (0 errores)"
-             << endl;
+      if (!hubo_cambio) {
+        cout << "Convergencia alcanzada. Entrenamiento detenido.\n";
         break;
       }
 
-      // 2. Cambio en pesos es insignificante
-      if (cambio_pesos < convergence_threshold) {
-        cout << "  ✓ Convergencia por pesos estables en época " << epoca
-             << " (cambio: " << cambio_pesos << ")" << endl;
+      if (cambio_maximo > 10.0f) {
+        cout << "Pesos desbordados. Entrenamiento "
+                "detenido.\n";
         break;
       }
 
-      // 3. Sin mejora durante 'patience' épocas
-      if (epocas_sin_mejora >= patience) {
-        cout << "  ⚠ Early stopping en época " << epoca << " (sin mejora por "
-             << patience << " épocas)" << endl;
-        break;
-      }
-
-      epoca++;
+      epoca_actual--;
     }
-
-    if (epoca > max_epocas) {
-      cout << "  ⏱ Alcanzado límite de épocas (" << max_epocas << ")" << endl;
-    }
-
-    cout << endl;
   }
 
   int predecir(const ImageData &imagen) {
@@ -215,101 +173,76 @@ public:
     }
     return fn(sum);
   }
-
-  float confidence(const ImageData &imagen) {
-    float sum = 0;
-    sum += bias * v_pesos[0];
-    for (int j = 0; j < imagen.pixels.size(); j++) {
-      float x = normalizacion(imagen.pixels[j]);
-      sum += v_pesos[j + 1] * x;
-    }
-    return sum; // Retornar valor sin activación
-  }
 };
 
 int main() {
-  cout << "=== PERCEPTRÓN CON EARLY STOPPING (MULTITHREAD) ===" << endl;
-
+  cout << "\n=== ENTRENAMIENTO CON THREADS Y CONTROL DE PESOS ===" << endl;
   vector<ImageData> train_data = load_all_batches();
   vector<ImageData> test_data = load_test_batch();
-
   cout << "Datos de entrenamiento: " << train_data.size() << endl;
   cout << "Datos de prueba: " << test_data.size() << endl;
 
   vector<Perceptron> perceptrones;
-  perceptrones.reserve(CANT_PERCEPTRONS);
   for (int label = 0; label < CANT_PERCEPTRONS; label++) {
-    perceptrones.emplace_back(label, train_data[0].pixels.size(), 0, 0.01f,
-                              train_data);
+    perceptrones.push_back(
+        Perceptron(label, train_data[0].pixels.size(), 0, 0.0001, train_data));
   }
-
-  cout << "\n=== ENTRENAMIENTO EN PARALELO ===" << endl;
 
   vector<thread> threads;
+
   for (int i = 0; i < CANT_PERCEPTRONS; i++) {
-    threads.emplace_back(
-        [&perceptrones, i]() { perceptrones[i].entrenamiento(100, 1e-5, 5); });
+    threads.emplace_back([&perceptrones, i]() {
+      cout << "Iniciando entrenamiento del perceptrón " << i << " en thread "
+           << this_thread::get_id() << endl;
+      perceptrones[i].entrenamiento(20);
+      cout << "Perceptrón " << i << " completado" << endl;
+    });
   }
 
-  // Esperar a que todos los hilos terminen
   for (auto &t : threads) {
     t.join();
   }
 
-  cout << "\n=== EVALUACIÓN ===" << endl;
+  cout << "Todos los threads han completado el entrenamiento" << endl;
+
+  cout << "\n--- PRUEBAS ---" << endl;
   int aciertos = 0;
   int total = test_data.size();
-  vector<vector<int>> confusion(10, vector<int>(10, 0));
 
   for (int i = 0; i < total; i++) {
     ImageData &imagen = test_data[i];
     int label_real = imagen.label;
 
-    // Buscar perceptrón con mayor confianza
-    float max_confidence = -1e9;
-    int pred_label = -1;
+    int pred_label = 0;
+    float max_confianza = -1e9;
 
     for (int j = 0; j < CANT_PERCEPTRONS; j++) {
-      float conf = perceptrones[j].confidence(imagen);
-      if (conf > max_confidence) {
-        max_confidence = conf;
+
+      float sum = perceptrones[j].v_pesos[0]; // bias
+      for (int k = 0; k < imagen.pixels.size(); k++) {
+        float x = (imagen.pixels[k] / 255.0f) * 2.0f - 1.0f;
+        sum += perceptrones[j].v_pesos[k + 1] * x;
+      }
+
+      if (sum > max_confianza) {
+        max_confianza = sum;
         pred_label = j;
       }
     }
 
-    confusion[label_real][pred_label]++;
     if (pred_label == label_real)
       aciertos++;
 
     if (i < 20) {
-      cout << "Imagen " << i << " - Real: " << label_real
-           << " | Predicho: " << pred_label << " | "
-           << (pred_label == label_real ? "✓" : "✗") << endl;
+      cout << "Imagen " << i << " - Real: " << (int)label_real
+           << " Predicho: " << pred_label << endl;
     }
   }
 
   float precision = (aciertos * 100.0f) / total;
   cout << "\n=== RESULTADOS ===" << endl;
-  cout << "Precisión total: " << aciertos << "/" << total << " (" << precision
-       << "%)" << endl;
-
-  // Precisión por clase
-  cout << "\nPrecisión por clase:" << endl;
-  vector<string> class_names = {"avión", "auto", "pájaro",  "gato",  "ciervo",
-                                "perro", "rana", "caballo", "barco", "camión"};
-
-  for (int i = 0; i < 10; i++) {
-    int total_class = 0;
-    for (int j = 0; j < 10; j++)
-      total_class += confusion[i][j];
-
-    if (total_class > 0) {
-      float class_acc = (confusion[i][i] * 100.0f) / total_class;
-      cout << "  Clase " << i << " (" << class_names[i]
-           << "): " << confusion[i][i] << "/" << total_class << " ("
-           << class_acc << "%)" << endl;
-    }
-  }
+  cout << "Aciertos: " << aciertos << "/" << total << " (" << precision << "%)"
+       << endl;
 
   cout << "\n=== COMPLETADO ===" << endl;
   return 0;
